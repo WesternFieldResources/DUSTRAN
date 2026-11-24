@@ -11,6 +11,8 @@ flights 17.0-19.4 UTC, noted per row). The ratio DUSTRAN / Sentinel per band is 
 import sys
 from pathlib import Path
 import numpy as np
+import sys as _sys; _sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
+from dustran.paths import DATA
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import playa_gas_tau as T
@@ -18,8 +20,8 @@ T.GROUND_KM, T.SENSOR_KM = 0.79, 20.15          # CIA/ozone layers inside Model 
 import playa_gas_score as P
 from dustran import atmosphere, rayleigh, sos, aerosol
 
-D = Path("D:/workspace/dustran_data/ivanpah")
-XS = Path("D:/workspace/dustran_data/hitran_xsec")
+D = (DATA / "ivanpah")
+XS = (DATA / "hitran_xsec")
 FLIGHTS = {"f171207t01p00r07": ("s2_20171207", 2017, 341), "f180906t01p00r07": ("s2_20180908", 2018, 249),
            "f201005t01p00r09": ("s2_20201007", 2020, 279), "f210224t01p00r07": ("s2_20210224", 2021, 55)}
 BANDS = {"B02": (492.4, 66), "B03": (559.8, 36), "B04": (664.6, 31), "B05": (704.1, 15), "B06": (740.5, 15),
@@ -44,7 +46,7 @@ def run(f, s2dir, year, doy):
     S = dict(L=L, centers=wl, fwhm=z["fwhm"], sza=o[4], vza=o[2], saz=o[3], vaz=o[1], bbl=bbl, doy=doy)
     M = P.Model([D / "tau_swir", D / "tau_vnir"], S,
                 cia_files={XS / "O2-O2_2024.cia": ("O2", "O2"), XS / "O2-N2_2024.cia": ("O2", "N2")},
-                o3_file="D:/workspace/dustran_data/bremen_o3/serdyuchenkogorshelev5digits.dat",
+                o3_file=str(DATA / "bremen_o3/serdyuchenkogorshelev5digits.dat"),
                 gas_scale={"CO2": atmosphere.co2_ppm(year) / 330.2})
     prof = atmosphere.load_afgl(T.AFGL)
     cm1 = atmosphere.layers(prof, 0.79)["col"]["H2O"].sum() / 3.3428e22

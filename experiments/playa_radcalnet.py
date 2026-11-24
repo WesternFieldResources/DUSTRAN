@@ -10,6 +10,8 @@ judged for smoothness.
 import argparse, sys
 from pathlib import Path
 import numpy as np
+import sys as _sys; _sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
+from dustran.paths import DATA
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import playa_gas_score as P
 
@@ -26,9 +28,9 @@ wr, rr = np.array(spec).T; ok = rr < 9
 wr, rr = wr[ok], rr[ok]
 print(f"RadCalNet 21:30: water {head['WV'][col]} cm, AOD {head['AOD'][col]}, Angstrom {head['Ang'][col]}, P {head['P'][col]} hPa")
 
-S = P.load_scene(); wl = S["centers"]; X = Path("D:/workspace/dustran_data/hitran_xsec")
+S = P.load_scene(); wl = S["centers"]; X = (DATA / "hitran_xsec")
 CIA = {X / "O2-O2_2024.cia": ("O2", "O2"), X / "O2-N2_2024.cia": ("O2", "N2")}
-O3 = "D:/workspace/dustran_data/bremen_o3/serdyuchenkogorshelev5digits.dat"
+O3 = str(DATA / "bremen_o3/serdyuchenkogorshelev5digits.dat")
 M = P.Model(a.taudir.split(","), S, cia_files=CIA if a.cia else None,
             o3_file=O3 if a.o3 else None, o3_du=float(head["O3"][col]) if a.o3 else None)   # comma-separated segment dirs
 lin = lambda x: 0.389 + 0.063e-3 * (x - 1500)

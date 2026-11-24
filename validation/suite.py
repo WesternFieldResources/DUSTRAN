@@ -15,10 +15,12 @@ Seam ratios are reported against 1 (flag >1 %), never corrected.
 import json, subprocess, sys
 from pathlib import Path
 import numpy as np
+import sys as _sys; _sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
+from dustran.paths import DATA
 R = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(R)); sys.path.insert(0, str(R / "experiments"))
 
-D = Path("D:/workspace/dustran_data")
+D = DATA
 PY = sys.executable
 BASE = R / "validation/baseline.json"
 TOL = {"ratio": 0.005, "water": 0.02, "seam": 0.002}
@@ -78,8 +80,8 @@ def case_water():
 
 CASES = {"ng2020": case_ng2020, "classic2019": case_classic2019,
          **{k: (lambda k=k: case_ivanpah(k)) for k in IVANPAH}, "water": case_water}
-RERUN = [["experiments/playa_rayleigh.py", "D:/workspace/dustran_data/playa_rrv_vnir,D:/workspace/dustran_data/playa_rrv",
-          "D:/workspace/dustran_data/radcalnet/RVUS00_2020_194_v00.06.input", "--aeronet"],
+RERUN = [["experiments/playa_rayleigh.py", f"{DATA}/playa_rrv_vnir,{DATA}/playa_rrv",
+          str(DATA / "radcalnet/RVUS00_2020_194_v00.06.input"), "--aeronet"],
          ["experiments/classic_playa.py"], ["experiments/ivanpah_three_way.py"]]
 
 

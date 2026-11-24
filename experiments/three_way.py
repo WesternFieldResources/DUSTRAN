@@ -19,11 +19,13 @@ response functions aren't downloaded; fine for a smooth playa spectrum).
 import sys
 from pathlib import Path
 import numpy as np
+import sys as _sys; _sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
+from dustran.paths import DATA
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import classic_playa as C
 
 DAY = "2020" if "--2020" in sys.argv else "2019"
-S2 = Path(f"D:/workspace/dustran_data/{'s2_20200712' if DAY == '2020' else 's2_20190812'}/crop")
+S2 = Path(f"{DATA}/{'s2_20200712' if DAY == '2020' else 's2_20190812'}/crop")
 BANDS = {"B02": (492.4, 66), "B03": (559.8, 36), "B04": (664.6, 31), "B05": (704.1, 15), "B06": (740.5, 15),
          "B07": (782.8, 20), "B8A": (864.7, 21), "B11": (1613.7, 91), "B12": (2202.4, 175)}
 T_S2, T_AV = (18 + 29.3 / 60, "21:30") if DAY == "2020" else (18 + 29 / 60, 22.2208)   # 2020: RadCalNet 22:00 missing; flight 21:50
@@ -45,13 +47,13 @@ def band_avg(wl, y, c, w):
 if __name__ == "__main__":
     scl = np.fromfile(S2 / "SCL.img", "<f4").reshape(201, 201)[100 - HW:100 + HW + 1, 100 - HW:100 + HW + 1]
     print("Sentinel-2 scene classes in the box:", dict(zip(*np.unique(scl, return_counts=True))), "(5 = bare soil, 8-10 = cloud)")
-    rcn = Path("D:/workspace/dustran_data/radcalnet") / ("RVUS00_2020_194_v00.06.input" if DAY == "2020" else C.RCN.name)
+    rcn = (DATA / "radcalnet") / ("RVUS00_2020_194_v00.06.input" if DAY == "2020" else C.RCN.name)
     _, wr, r_s2t, u_s2t = C.radcalnet(rcn, T_S2)
     _, wr2, r_avt, _ = C.radcalnet(rcn, T_AV)
     k = r_s2t / np.interp(wr, wr2, r_avt)          # RadCalNet diurnal factor, Sentinel time / AVIRIS time
     if DAY == "2020":                              # AVIRIS-NG: DUSTRAN with AERONET aerosol (no NASA product here)
         import playa_gas_score as P
-        z = np.load("D:/workspace/dustran_data/ng_2020_playa_runs.npz")
+        z = np.load(str(DATA / "ng_2020_playa_runs.npz"))
         wl, dus = z["wl"], z["AERONET_0.062"]; nasa = np.full(len(wl), np.nan)
         good = P.load_scene()["bbl"] > 0
         other = "-"
@@ -72,4 +74,4 @@ if __name__ == "__main__":
         na = band_avg(wl[o], np.where(good, nasa * kk, np.nan)[o], c, w)
         rows.append((b, c, s2, rc, du, na))
         print(f"{b:5s} {c:6.0f} {s2:7.4f} {rc:10.4f} {du:8.4f} {na:7.4f}   {rc / s2:.3f} / {du / s2:.3f} / {na / s2:.3f}")
-    np.save(C.SC / "three_way.npy" if DAY == "2019" else Path("D:/workspace/dustran_data/three_way_2020.npy"), np.array([r[1:] for r in rows]))
+    np.save(C.SC / "three_way.npy" if DAY == "2019" else (DATA / "three_way_2020.npy"), np.array([r[1:] for r in rows]))

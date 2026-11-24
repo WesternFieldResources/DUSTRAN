@@ -16,7 +16,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from dustran import atmosphere, gas
 
-AFGL = r"D:\workspace\dustran_data\afgl\afglus.dat"   # AFGL US standard (Anderson et al. 1986)
+from dustran.paths import DATA
+AFGL = str(DATA / "afgl/afglus.dat")   # AFGL US standard (Anderson et al. 1986)
 GROUND_KM, SENSOR_KM = 1.4357627632017484, 5.313446641146695
 
 

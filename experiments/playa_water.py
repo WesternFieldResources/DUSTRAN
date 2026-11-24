@@ -15,6 +15,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import playa_gas_score as P
+import playa_gas_tau as T
 from dustran import atmosphere
 
 taudir, rcn = sys.argv[1], sys.argv[2]
@@ -26,7 +27,7 @@ for r in rows:
 col = head["UTC"].index("21:30")
 spec = np.array([(float(r[0]), float(r[1 + col])) for r in rows if r and r[0].strip().isdigit()][:191])
 spec = spec[spec[:, 1] < 9]
-L0 = atmosphere.layers(atmosphere.load_afgl(r"D:\workspace\dustran_data\afgl\afglus.dat"),
+L0 = atmosphere.layers(atmosphere.load_afgl(T.AFGL),
                        surface_km=P.Model.__init__.__globals__.get("GROUND_KM", 1.4357627632017484))
 cm1 = L0["col"]["H2O"].sum() / 3.3428e22                    # AFGL column above the playa, g cm^-2
 print(f"AFGL US std water above playa: {cm1:.3f} cm; RadCalNet photometer: {head['WV'][col]} cm "

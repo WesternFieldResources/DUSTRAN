@@ -13,6 +13,8 @@ where r is the gas-corrected apparent reflectance (gas transmittance divided out
 import argparse, sys, time
 from pathlib import Path
 import numpy as np
+import sys as _sys; _sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
+from dustran.paths import DATA
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import playa_gas_score as P
@@ -33,9 +35,9 @@ spec = np.array([(float(r[0]), float(r[1 + col])) for r in rows if r and r[0].st
 spec = spec[spec[:, 1] < 9]; wr, rr = spec.T
 
 S = P.load_scene(); wl = S["centers"]
-X = Path("D:/workspace/dustran_data/hitran_xsec")
+X = (DATA / "hitran_xsec")
 M = P.Model(a.taudirs.split(","), S, cia_files={X / "O2-O2_2024.cia": ("O2", "O2"), X / "O2-N2_2024.cia": ("O2", "N2")},
-            o3_file="D:/workspace/dustran_data/bremen_o3/serdyuchenkogorshelev5digits.dat",
+            o3_file=str(DATA / "bremen_o3/serdyuchenkogorshelev5digits.dat"),
             o3_du=float(head["O3"][col]))
 r_app = M.rho(2.15, 0.389 + 0.063e-3 * (wl - 1500))
 
@@ -84,7 +86,7 @@ if a.aeronet:
     aer, meas = aeronet_aerosol.load()
     runs[f"AERONET {meas[500]:.3f}"] = solve(meas[500], aer, 500)
 
-np.savez("D:/workspace/dustran_data/ng_2020_playa_runs.npz", wl=wl, **{k.replace(" ", "_"): v for k, v in runs.items()})
+np.savez(str(DATA / "ng_2020_playa_runs.npz"), wl=wl, **{k.replace(" ", "_"): v for k, v in runs.items()})
 good = S["bbl"] > 0
 to10 = lambda y: np.array([np.nanmean(np.where(good & (abs(wl - c) <= 5), y, np.nan)) for c in wr])
 ok = np.isfinite(to10(r_app))

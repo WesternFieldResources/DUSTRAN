@@ -11,10 +11,12 @@ distribution is the robust part. Files live outside the repo in dustran_data/aer
 import csv, sys
 from pathlib import Path
 import numpy as np
+import sys as _sys; _sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
+from dustran.paths import DATA
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from dustran.aerosol import Measured
 
-DIR = Path("D:/workspace/dustran_data/aeronet_2020_194")
+DIR = (DATA / "aeronet_2020_194")
 
 
 def _load(f, date="12:07:2020", d=DIR):

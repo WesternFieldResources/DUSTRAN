@@ -14,13 +14,15 @@ solver. Water and a wavelength shift are fitted; everything else is from measure
 import sys, time
 from pathlib import Path
 import numpy as np
+import sys as _sys; _sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
+from dustran.paths import DATA
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import playa_gas_score as P
 import playa_gas_tau as T
 from dustran import atmosphere, rayleigh, sos, aerosol
 
-D = Path("D:/workspace/dustran_data")
+D = DATA
 SC = D / "classic_f190813t01p00r07"
 RDN = SC / "f190813t01p00r07rdn_e"
 RCN = D / "radcalnet/RVUS00_2019_225_v00.06.input"
@@ -75,10 +77,10 @@ if __name__ == "__main__":
     print("RadCalNet", UTC, atm)
     S = scene(); wl = S["centers"]
     print(f"playa: {S['npx']} px, sza {S['sza']:.1f}, vza {S['vza']:.1f}")
-    XS = Path("D:/workspace/dustran_data/hitran_xsec")
+    XS = (DATA / "hitran_xsec")
     M = P.Model([SC / "tau_swir", SC / "tau_vnir"], S,
                 cia_files={XS / "O2-O2_2024.cia": ("O2", "O2"), XS / "O2-N2_2024.cia": ("O2", "N2")},
-                o3_file="D:/workspace/dustran_data/bremen_o3/serdyuchenkogorshelev5digits.dat",
+                o3_file=str(DATA / "bremen_o3/serdyuchenkogorshelev5digits.dat"),
                 o3_du=atm["O3"], gas_scale={"CO2": atmosphere.co2_ppm(YEAR) / 330.2})
     prof = atmosphere.load_afgl(T.AFGL)
     cm1 = atmosphere.layers(prof, GROUND)["col"]["H2O"].sum() / 3.3428e22

@@ -20,12 +20,14 @@ the 2nd difference of the spectrum, % of median) per gas window.
 import argparse, sys
 from pathlib import Path
 import numpy as np
+import sys as _sys; _sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
+from dustran.paths import DATA
 from scipy.interpolate import UnivariateSpline
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from dustran import instrument
 
-D = Path("D:/workspace/dustran_data")
+D = DATA
 SCENE = D / "ng_20200712_playa/scene.npz"        # frozen from NASA L1B radiance + obs; band table from its header
 TSIS = D / "tsis/tsis_f0_0p1.txt"                  # TSIS-1 HSRS (Coddington et al. 2021), 0.1 nm
 R, C, HW = 149, 541, 50

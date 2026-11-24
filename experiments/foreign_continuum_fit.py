@@ -13,6 +13,8 @@ that is real physics should transfer between instruments and altitudes.
 import sys
 from pathlib import Path
 import numpy as np
+import sys as _sys; _sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
+from dustran.paths import DATA
 R = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(R)); sys.path.insert(0, str(R / "experiments"))
 from dustran import atmosphere, dimer, foreign
@@ -20,9 +22,9 @@ import playa_gas_score as P
 import playa_gas_tau as T
 import classic_playa as C
 
-XS = Path("D:/workspace/dustran_data/hitran_xsec")
+XS = (DATA / "hitran_xsec")
 CIA = {XS / "O2-O2_2024.cia": ("O2", "O2"), XS / "O2-N2_2024.cia": ("O2", "N2")}
-O3 = "D:/workspace/dustran_data/bremen_o3/serdyuchenkogorshelev5digits.dat"
+O3 = str(DATA / "bremen_o3/serdyuchenkogorshelev5digits.dat")
 B940 = (880, 1000, ((850, 880), (1000, 1040)))
 B1140 = (1080, 1180, ((1040, 1075), (1230, 1260)))
 GAMMAS = (3.0, 10.0, 30.0)
@@ -50,9 +52,9 @@ def scenes():
                gas_scale={"CO2": atmosphere.co2_ppm(C.YEAR) / 330.2})
     out["Classic 2019"] = dict(M=M, S=S, ground=np.interp(S["centers"], wr, rr), shift=0.0, photo=1.00,
                                surface=C.GROUND, sensor=C.SENSOR)
-    atm, wr, rr, _ = C.radcalnet("D:/workspace/dustran_data/radcalnet/RVUS00_2020_194_v00.06.input", "21:30")
+    atm, wr, rr, _ = C.radcalnet(str(DATA / "radcalnet/RVUS00_2020_194_v00.06.input"), "21:30")
     S = P.load_scene()
-    M = ModelF("D:/workspace/dustran_data/playa_rrv", S)
+    M = ModelF(str(DATA / "playa_rrv"), S)
     out["NG 2020"] = dict(M=M, S=S, ground=np.interp(S["centers"], wr, rr),
                           shift=0.389 + 0.063e-3 * (S["centers"] - 1500), photo=1.19,
                           surface=T.GROUND_KM, sensor=T.SENSOR_KM)
@@ -102,4 +104,4 @@ if __name__ == "__main__":
                 print(f"gamma {g:4.0f}  A {f * A0:.3e} ({f:4.2f})  {name:12s} 940 {w9:.3f} cm ({100 * r9:.2f}%)  "
                       f"1140 {w11:.3f} cm ({100 * r11:.2f}%)   photometer {d['photo']:.2f}", flush=True)
         res[(g, "A0")] = A0
-    np.save(Path("D:/workspace/dustran_data/foreign_fit.npy"), np.array([res], dtype=object))
+    np.save((DATA / "foreign_fit.npy"), np.array([res], dtype=object))
