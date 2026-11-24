@@ -19,7 +19,7 @@ Once per scene
     scaled to a measured column), TSIS-1 solar spectrum. CO2 scaled to the flight year.
   * Band wavelength shift: given (A + B (nm - 1500)), or fitted from the scene itself ("fit"): one
     shift per spectrometer (Classic has four, split at its seams), chosen to make the gas-corrected
-    median spectrum smoothest across the O2 760 nm and CO2 1600 / 2060 nm bands. Spectrometers
+    median spectrum smoothest across the O2 760 nm and CO2 1600 nm bands. Spectrometers
     with no usable gas band take the nearest fitted one's shift.
   * A small gas table built on the fly (no stored lookup tables): ln band<E_sun T_gas> for
     ~40 water scales x a few view zenith angles.
@@ -61,7 +61,10 @@ H2O_CM = 1 / 3.3428e22                    # molecules cm^-2 -> g cm^-2 (precipit
 WATER = {"940": ((880, 1000), ((850, 880), (1000, 1040))),
          "1140": ((1080, 1180), ((1040, 1075), (1230, 1260)))}
 SCAT_GRID = np.r_[np.arange(400, 1000, 25.0), np.arange(1000, 2501, 150.0)]
-SHIFT_WINDOWS = {"O2 760": (745, 785), "CO2 1600": (1550, 1630), "CO2 2060": (1980, 2100)}
+# CO2 2010/2060 is not used: on AVIRIS Classic (10 nm bands) its roughness minimum moved the SWIR
+# spectrometer by +2.7 nm at Cerbat (2017-12-06), which erased the real 2200 nm Al-OH band and
+# made a false 2165 nm one (checked against NASA reflectance at the same pixels).
+SHIFT_WINDOWS = {"O2 760": (745, 785), "CO2 1600": (1550, 1630)}
 OPAQUE_T = 0.01                           # two-way band transmittance below which a band is no data
 # Conservative default: band ranges with no data on any day. Derived with experiments/core_opaque.py
 # from DUSTRAN's line-by-line water (ground 1.5 km, sun and view at zenith, 5 and 10 nm bands):
@@ -219,7 +222,7 @@ class Scene:
             self.shift, self.shift_fit = self._fit_shift(wn, E, dry_all, dry_below, wet_all, wet_below,
                                                          mu_v, L_med)
             log(f"shift fit ({time.time() - t0:.0f}s): " + "; ".join(
-                f"{k}: {v['shift']:+.2f} nm" + (f" ({v['from']})" if 'from' in v else "")
+                f"{k}: {v['shift']:+.2f} nm" + (f" (from {v['from']}; FLAG {v['flag']})" if 'from' in v else "")
                 for k, v in self.shift_fit.items()))
         else:
             self.shift = shift[0] + shift[1] * (self.c - 1500)
@@ -287,7 +290,7 @@ class Scene:
         y = np.exp(-(dry_all / self.mu_s + dry_below / mu_v)) * E * np.exp(-(wet_all / self.mu_s + wet_below / mu_v))
         bounds = [0] + instrument.seams(self.c) + [len(self.c)]
         shifts = np.full(len(self.c), np.nan)
-        info, cand = {}, np.round(np.arange(-2.0, 2.001, 0.1), 2)
+        info, cand = {}, np.round(np.arange(-4.0, 4.001, 0.1), 2)
         for a, b in zip(bounds[:-1], bounds[1:]):
             name = f"{self.c[a]:.0f}-{self.c[b - 1]:.0f} nm"
             idx = np.arange(a, b)
@@ -306,9 +309,14 @@ class Scene:
                     q = r[k:k + len(w)]; k += len(w)
                     parts.append(np.sqrt(np.mean(np.diff(q, 2) ** 2)) / np.median(q))
                 cost.append(np.sqrt(np.mean(np.square(parts))))
-            cost = np.array(cost); j = int(np.clip(np.argmin(cost), 1, len(cand) - 2))
+            cost = np.array(cost); j0 = int(np.argmin(cost))
+            if j0 in (0, len(cand) - 1):              # minimum on the grid edge: not a fit
+                info[name] = None
+                continue
+            j = j0
             den = cost[j - 1] - 2 * cost[j] + cost[j + 1]
-            s = cand[j] + (0.5 * (cost[j - 1] - cost[j + 1]) / den * 0.1 if den > 0 else 0.0)
+            d = np.clip(0.5 * (cost[j - 1] - cost[j + 1]) / den, -1, 1) if den > 0 else 0.0
+            s = cand[j] + d * 0.1
             shifts[a:b] = s
             info[name] = dict(shift=float(s), roughness_pct=float(100 * cost.min()),
                               windows=[k for k, (lo, hi) in SHIFT_WINDOWS.items()
@@ -318,7 +326,8 @@ class Scene:
             if info[name] is None:                    # nearest fitted spectrometer
                 na, nb_ = min(fitted, key=lambda ab: abs(ab[0] - a))
                 shifts[a:b] = shifts[na]
-                info[name] = dict(shift=float(shifts[na]), **{"from": f"{self.c[na]:.0f}-{self.c[nb_ - 1]:.0f} nm"})
+                info[name] = dict(shift=float(shifts[na]), **{"from": f"{self.c[na]:.0f}-{self.c[nb_ - 1]:.0f} nm"},
+                                  flag="no usable gas band or no minimum inside +-4 nm")
         return shifts, info
 
     def _scattering(self, aer, aod, ref):
