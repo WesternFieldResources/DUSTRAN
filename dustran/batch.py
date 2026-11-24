@@ -25,7 +25,8 @@ Per pixel (vectorised, in row blocks)
   * r = gas-corrected apparent reflectance at that water; x = r - R_path;
     rho = x / (T_dn T_up + S x).
 
-Output: an ENVI BIL float32 reflectance cube with the input's band table and map info, a
+Output: an ENVI BIL float32 reflectance cube with the input's band table and map info (and the
+data provider's bad-band list: the radiance header's, or one copied with --bbl-from), a
 3-band water map (940 cm, 1140 cm, 940 fit rms %), and a JSON summary.
 Ground elevation, solar zenith for the gas paths and the aerosol are single values per scene.
 """
@@ -259,7 +260,7 @@ def relative_azimuth(vaz, saz):
     return d
 
 
-def run(rdn_hdr, obs_hdr, out_prefix, scene_kw, rows=64, log=print, max_lines=None):
+def run(rdn_hdr, obs_hdr, out_prefix, scene_kw, rows=64, log=print, max_lines=None, bbl_from=None):
     text, hdr, arr = read_header(rdn_hdr)
     centers, fwhm = arr("wavelength"), arr("fwhm")
     nl, nb, ns = int(hdr["lines"]), int(hdr["bands"]), int(hdr["samples"])
@@ -317,9 +318,10 @@ def run(rdn_hdr, obs_hdr, out_prefix, scene_kw, rows=64, log=print, max_lines=No
             log(f"rows {r1}/{nl}  {el / 60:.1f} min  eta {el / r1 * (nl - r1) / 60:.1f} min")
     rfl.flush(); wat.flush()
     extra = None
-    if "bbl" not in hdr:       # radiance headers often carry none: mark the opaque water bands and < 395 nm
-        bbl = (centers > 395) & ~((centers > 1350) & (centers < 1440)) & ~((centers > 1805) & (centers < 1985))
-        extra = {"bbl": "{ " + " , ".join(f"{float(b):.1f}" for b in bbl) + " }"}
+    if bbl_from and "bbl" not in hdr:   # the data provider's bad-band list (never invented here)
+        _, h2, a2 = read_header(bbl_from)
+        assert np.allclose(a2("wavelength"), centers), "bbl source has a different band table"
+        extra = {"bbl": h2["bbl"]}
     write_header(str(out_img) + ".hdr", text, "DUSTRAN surface reflectance (Lambertian, plane-parallel)",
                  extra=extra)
     write_header(str(wat_img) + ".hdr", text, "DUSTRAN water column", bands=3,
@@ -360,6 +362,7 @@ if __name__ == "__main__":
     ap.add_argument("--aod", type=float, default=None, help="AOD at 550 nm (lognormal dust, Angstrom below)")
     ap.add_argument("--angstrom", type=float, default=1.2)
     ap.add_argument("--rows", type=int, default=64)
+    ap.add_argument("--bbl-from", help="header whose bad-band list (bbl) to copy, e.g. the provider's reflectance product")
     ap.add_argument("--max-lines", type=int, default=None, help="process only the first N lines (testing)")
     a = ap.parse_args()
     kw = dict(taudirs=a.taudirs.split(","), ground_km=a.ground, sensor_km=a.sensor, o3_du=a.o3_du,
@@ -372,4 +375,4 @@ if __name__ == "__main__":
         print(f"AERONET: AOD500 {meas[500]:.3f}, photometer water {meas['PW']:.3f} cm")
     elif a.aod:
         kw.update(aer=aerosol.Dust.fit_angstrom(a.angstrom), aod=a.aod, aod_ref=550.0)
-    run(a.rdn_hdr, a.obs_hdr, a.out_prefix, kw, rows=a.rows, log=lambda s: print(s, flush=True), max_lines=a.max_lines)
+    run(a.rdn_hdr, a.obs_hdr, a.out_prefix, kw, rows=a.rows, log=lambda s: print(s, flush=True), max_lines=a.max_lines, bbl_from=a.bbl_from)
