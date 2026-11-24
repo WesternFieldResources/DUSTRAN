@@ -78,6 +78,25 @@ python validation/suite.py          # every validated day vs its references, com
 
 Cases whose data are missing are skipped.
 
+### 6. Correct a whole flight line
+
+`dustran/batch.py` corrects every pixel of an orthorectified radiance cube at once (numpy, in
+row blocks; no per-pixel Python loops). First compute the line-by-line gas optical depths for the
+scene's median ground elevation and the sensor altitude (step 5), then:
+
+```
+python -m dustran.batch RDN_img.hdr RDN_obs_ort.hdr OUT/prefix --taudirs TAU_VNIR,TAU_SWIR \
+    --ground 1.52 --sensor 4.64 --o3-du 282 \
+    --aeronet DUSTRAN_DATA/aeronet_... --inv-time HH:MM:SS --sun-time HH:MM:SS --date DD:MM:YYYY
+```
+
+Per scene it builds a small gas table (band-averaged sunlight x gas transmittance for ~40 water
+amounts and 3 view angles) and the scattering terms for 9 view geometries; per pixel it fits water
+at 940 nm (1140 nm as a cross-check), then inverts the radiance equation. Writes an ENVI
+reflectance cube with the input's band table and map info, a water map and a JSON summary
+(water percentiles, 940/1140 agreement flag, seams). An AVIRIS-NG line (3681 x 737 px) takes
+~4 min of set-up and ~7 min of correction.
+
 Status: research code. See `STACK.md` for the design and each layer's status, `RESULTS.md` for
 what has been validated, `PROVENANCE.md` for where every piece came from and its license, and
 `BIBLIOGRAPHY.md` for the published work it is built on.
