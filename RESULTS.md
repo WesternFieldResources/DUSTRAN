@@ -67,5 +67,22 @@ Details: `docs/classic_2019_playa.md`.
   the yardstick version worsens the in-band fit shape in three of four fits.
 - Lorentzian line wings beyond 25 cm⁻¹ supply only a seventh of that absorption, so far wings
   are not the mechanism.
+- **Measured foreign continuum (`dustran/foreign.py`, `experiments/foreign_continuum_fit.py`):**
+  a collision band under every HITRAN water line, widths 3, 10 and 30 cm⁻¹, strength A fitted to
+  the photometer on one day and applied blind to the other.
+
+  | Strength that puts 940 water on the photometer | Classic 2019 | NG 2020 |
+  |---|---|---|
+  | width 30 cm⁻¹ | A ≈ 0.024 atm⁻¹ | A ≈ 0.049 atm⁻¹ |
+
+  - **It does not transfer.** NG needs twice the strength Classic needs. Fitted on Classic, NG's
+    940 water stays 12 % high; fitted on NG, Classic's drops 9 % low.
+  - **The two bands disagree differently on each day:** Classic needs more continuum at 1140
+    than at 940; NG needs more at 940 than at 1140.
+  - **The in-band fit shape gets worse** as the continuum grows, at every width.
+  - **Conclusion:** a single universal absorber can't explain the water bias. What is left
+    differs by day or instrument, which points to the water profile shape (the standard
+    atmosphere is wrong differently on each day) or the band response, not to missing
+    spectroscopy. Not adopted.
 - Remaining suspects: the water profile shape (no per-scene profile yet), the line shape inside
   25 cm⁻¹, and the photometer's own ~10 % uncertainty.

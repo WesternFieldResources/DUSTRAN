@@ -75,8 +75,9 @@ uncertain, so it is computed coarsely. The two are multiplied together.
   scales with water squared, so it is negligible over dry deserts and matters on humid scenes.
 - Foreign continuum (water–N2/O2): needed. On both playa test days a continuum of the expected
   size moves fitted water 10–15 % toward the photometer. Line wings beyond 25 cm⁻¹ supply only a
-  seventh of it. **To build:** collision band under each line plus a near-wing correction, with
-  parameters from laboratory measurements, checked (not fitted) on playa days with photometers.
+  seventh of it. A collision band under each line (`foreign.py`), measured on one playa day,
+  does not transfer to the other (RESULTS.md §4), so it is not adopted. Next: per-scene water
+  profiles, then retest.
 
 ### Scattering: `dustran/sos.py`
 - Successive orders of scattering, Fourier azimuth modes, Gauss streams, delta-M; outputs
