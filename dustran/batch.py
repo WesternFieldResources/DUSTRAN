@@ -1,8 +1,14 @@
 """Whole-scene atmospheric correction: every pixel of a flight line at once, in numpy.
 
-    python -m dustran.batch RADIANCE_HDR OBS_ORT OUT_PREFIX --taudirs DIR[,DIR] --ground KM --sensor KM
+    python -m dustran.batch RADIANCE OUT_PREFIX --taudirs DIR[,DIR] --ground KM --sensor KM
+                            [--obs OBS_ORT_HDR] [--shift A B | --shift fit] [--year 2017]
                             [--o3-du 282] [--aeronet DIR --inv-time T --sun-time T --date DD:MM:YYYY]
-                            [--aod 0.05] [--pressure-ratio 1.0] [--shift A B] [--rows N]
+                            [--aod 0.05] [--pressure-ratio 1.0] [--lines R0 R1] [--bbl-from HDR]
+
+RADIANCE is either an AVIRIS-NG ortho radiance header (*_rdn_*_img.hdr, float32 BIL, with --obs
+pointing at its *_obs_ort.hdr) or an unpacked AVIRIS Classic radiance folder (fYYMMDDtNNpNNrNN_rdn_X:
+int16 BIP big-endian scaled by the .gain file, band table from .spc, *_obs_ort beside it).
+`classic_geometry(folder)` returns the ground elevation and sensor altitude for the gas run.
 
 Same physics as the validated playa chain (experiments/playa_rayleigh.py, classic_playa.py),
 reorganised so that the per-pixel work is array arithmetic:
@@ -10,12 +16,17 @@ reorganised so that the per-pixel work is array arithmetic:
 Once per scene
   * Line-by-line gas optical depths (from experiments/playa_gas_tau.py at the scene's ground
     elevation and sensor altitude), O2 collision-induced absorption, ozone (Bremen cross sections
-    scaled to a measured column), TSIS-1 solar spectrum.
+    scaled to a measured column), TSIS-1 solar spectrum. CO2 scaled to the flight year.
+  * Band wavelength shift: given (A + B (nm - 1500)), or fitted from the scene itself ("fit"): one
+    shift per spectrometer (Classic has four, split at its seams), chosen to make the gas-corrected
+    median spectrum smoothest across the O2 760 nm and CO2 1600 / 2060 nm bands. Spectrometers
+    with no usable gas band take the nearest fitted one's shift.
   * A small gas table built on the fly (no stored lookup tables): ln band<E_sun T_gas> for
-    ~40 water scales x a few view zenith angles, with the fitted Gaussian band shift.
+    ~40 water scales x a few view zenith angles.
   * Scattering terms R_path, T_dn T_up, S from dustran/sos.py on a coarse wavelength grid, for a
     few view geometries (view zenith x relative azimuth); Rayleigh + aerosol (AERONET-measured
     sizes and index, or a lognormal fitted to an Angstrom exponent).
+  * Seam check (spectrometer overlaps): reported and flagged at 1 %, never corrected.
 
 Per pixel (vectorised, in row blocks)
   * Water: the scale that makes the gas-corrected spectrum flattest across the 940 nm band,
@@ -25,12 +36,17 @@ Per pixel (vectorised, in row blocks)
   * r = gas-corrected apparent reflectance at that water; x = r - R_path;
     rho = x / (T_dn T_up + S x).
 
-Output: an ENVI BIL float32 reflectance cube with the input's band table and map info (and the
-data provider's bad-band list: the radiance header's, or one copied with --bbl-from), a
-3-band water map (940 cm, 1140 cm, 940 fit rms %), and a JSON summary.
-Ground elevation, solar zenith for the gas paths and the aerosol are single values per scene.
+Bad-band list (bbl) in the output, first available of:
+  1. the data provider's: the radiance header's bbl, or one copied with --bbl-from;
+  2. this scene's: bands whose two-way gas transmittance at the scene's median water is < 1 %
+     (no light reaches the sensor there: no data, never data);
+  3. the conservative default CORE_OPAQUE_NM (empty: see its note).
+
+Output: ENVI BIL float32 reflectance cube (band table, map info, bbl), a 3-band water map
+(940 cm, 1140 cm, 940 fit rms %), and a JSON summary. Ground elevation, solar zenith for the gas
+paths and the aerosol are single values per scene.
 """
-import argparse, json, re, sys, time
+import argparse, datetime, json, re, sys, time
 from pathlib import Path
 import numpy as np
 
@@ -45,6 +61,13 @@ H2O_CM = 1 / 3.3428e22                    # molecules cm^-2 -> g cm^-2 (precipit
 WATER = {"940": ((880, 1000), ((850, 880), (1000, 1040))),
          "1140": ((1080, 1180), ((1040, 1075), (1230, 1260)))}
 SCAT_GRID = np.r_[np.arange(400, 1000, 25.0), np.arange(1000, 2501, 150.0)]
+SHIFT_WINDOWS = {"O2 760": (745, 785), "CO2 1600": (1550, 1630), "CO2 2060": (1980, 2100)}
+OPAQUE_T = 0.01                           # two-way band transmittance below which a band is no data
+# Conservative default: band ranges with no data on any day. Derived with experiments/core_opaque.py
+# from DUSTRAN's line-by-line water (ground 1.5 km, sun and view at zenith, 5 and 10 nm bands):
+# even the 1380 / 1880 nm cores pass 2-4 % two-way at standard water (light leaks between lines),
+# so no band is "never data" at a high desert site. Empty on purpose; scene and provider lists override.
+CORE_OPAQUE_NM = ()
 
 
 # ---------------------------------------------------------------- ENVI helpers
@@ -56,65 +79,151 @@ def read_header(path):
     return text, hdr, arr
 
 
-def open_bil(hdr_path, bands=None):
-    _, hdr, _ = read_header(hdr_path)
-    shape = (int(hdr["lines"]), bands or int(hdr["bands"]), int(hdr["samples"]))
-    dt = {"4": "<f4", "5": "<f8"}[hdr["data type"]]
-    img = str(hdr_path)[:-4]
-    il = hdr.get("interleave", "bil").lower()
-    if il == "bil":
-        return np.memmap(img, dt, "r", shape=shape), "bil"
-    if il == "bip":
-        return np.memmap(img, dt, "r", shape=(shape[0], shape[2], shape[1])), "bip"
-    raise ValueError(f"interleave {il} not supported")
+def write_header(path, samples, lines, description, map_info, centers=None, fwhm=None, bbl=None,
+                 band_names=None, coord=None):
+    """A fresh ENVI header for a float32 BIL little-endian file."""
+    nb = len(centers) if centers is not None else len(band_names)
+    fmt = lambda a: "{ " + " , ".join(f"{float(x):.6g}" for x in a) + " }"
+    t = ["ENVI", "description = {\n  " + description + "}", f"samples = {samples}", f"lines = {lines}",
+         f"bands = {nb}", "header offset = 0", "file type = ENVI Standard", "data type = 4",
+         "interleave = bil", "byte order = 0"]
+    if map_info:
+        t.append("map info = {" + " ".join(map_info.strip("{}").split()) + "}")
+    if coord:
+        t.append(f"coordinate system string = {coord}")
+    if centers is not None:
+        t += ["wavelength units = Nanometers", "wavelength = " + fmt(centers), "fwhm = " + fmt(fwhm)]
+    if bbl is not None:
+        t.append("bbl = " + fmt(bbl))
+    if band_names:
+        t.append("band names = {" + ", ".join(band_names) + "}")
+    t.append("data ignore value = -9999")
+    Path(path).write_text("\n".join(t) + "\n")
 
 
-def write_header(path, template_text, description, bands=None, band_names=None, extra=None):
-    """Copy a header, replacing description (and band count/names for non-cube outputs)."""
-    t = re.sub(r"description\s*=\s*\{[^}]*\}", "description = {\n  " + description + "}", template_text, count=1)
-    if bands is not None:
-        keep = []
-        for line in t.splitlines():
-            k = line.split("=")[0].strip().lower()
-            if k in ("wavelength", "fwhm", "bbl", "band names", "smoothing factors", "wavelength file",
-                     "wavelength units", "data gain values", "default bands"):
-                continue
-            keep.append(line)
-        t = "\n".join(keep)
-        t = re.sub(r"^bands\s*=.*$", f"bands = {bands}", t, flags=re.M)
-        t += "\nband names = {" + ", ".join(band_names) + "}"
-    t = re.sub(r"^data type\s*=.*$", "data type = 4", t, flags=re.M)
-    t = re.sub(r"^interleave\s*=.*$", "interleave = bil", t, flags=re.M)
-    if "data ignore value" not in t:
-        t += "\ndata ignore value = -9999"
-    for k, v in (extra or {}).items():
-        t += f"\n{k} = {v}"
-    Path(path).write_text(t.rstrip() + "\n")
+# ---------------------------------------------------------------- readers
+def earth_sun_au(doy):
+    return 1 - 0.01672 * np.cos(np.radians(0.9856 * (doy - 4)))
+
+
+class NGReader:
+    """AVIRIS-NG: float32 BIL radiance [uW cm-2 nm-1 sr-1], float64 BIP obs_ort (11 bands)."""
+
+    def __init__(self, hdr_path, obs_hdr):
+        _, h, arr = read_header(hdr_path)
+        self.centers, self.fwhm = arr("wavelength"), arr("fwhm")
+        self.bbl = arr("bbl")
+        self.nl, self.nb, self.ns = int(h["lines"]), int(h["bands"]), int(h["samples"])
+        self.map_info, self.coord = h.get("map info"), h.get("coordinate system string")
+        self.rdn = np.memmap(str(hdr_path)[:-4], "<f4", "r", shape=(self.nl, self.nb, self.ns))
+        _, ho, _ = read_header(obs_hdr)
+        nbo = int(ho["bands"])
+        self.obs = np.memmap(str(obs_hdr)[:-4], "<f8", "r", shape=(self.nl, self.ns, nbo))
+        self.name = Path(hdr_path).name.split("_")[0]
+        o = self.sample_obs()
+        self.esd = float(np.median(o[:, 10]))
+
+    def sample_obs(self, step=7):
+        o = np.asarray(self.obs[::step, ::step, :]).reshape(-1, self.obs.shape[2])
+        return o[o[:, 0] > 0]
+
+    def block(self, r0, r1):
+        L = np.asarray(self.rdn[r0:r1], np.float64).transpose(0, 2, 1).reshape(-1, self.nb)
+        g = np.asarray(self.obs[r0:r1], np.float64).reshape(-1, self.obs.shape[2])
+        ok = (L[:, 0] > -9000) & (g[:, 0] > 0) & (np.nanmax(L, 1) > 0)
+        return L, g[:, :5], ok
+
+
+class ClassicReader:
+    """AVIRIS Classic: int16 BIP big-endian radiance / .gain = uW cm-2 nm-1 sr-1 (fill -50 outside
+    the swath), band table from .spc, float32 BIL obs_ort (10 bands, no Earth-Sun distance)."""
+
+    def __init__(self, folder):
+        d = Path(folder)
+        self.dir = d
+        img = next(d.glob("*_sc01_ort_img"))
+        _, h, _ = read_header(str(img) + ".hdr")
+        self.nl, self.nb, self.ns = int(h["lines"]), int(h["bands"]), int(h["samples"])
+        assert h.get("interleave", "").lower() == "bip" and h.get("byte order") == "1"
+        self.map_info, self.coord = h.get("map info"), h.get("coordinate system string")
+        self.rdn = np.memmap(img, ">i2", "r", shape=(self.nl, self.ns, self.nb))
+        self.gain = np.loadtxt(next(d.glob("*.gain")))[:, 0]
+        spc = np.loadtxt(next(d.glob("*.spc")))
+        self.centers, self.fwhm = spc[:, 0], spc[:, 1]
+        self.bbl = None
+        obs = next(d.glob("*_obs_ort"))
+        _, ho, _ = read_header(str(obs) + ".hdr")
+        assert int(ho["lines"]) == self.nl and int(ho["samples"]) == self.ns
+        self.obs = np.memmap(obs, "<f4", "r", shape=(self.nl, int(ho["bands"]), self.ns))
+        self.name = d.name.split("rdn")[0].rstrip("_")
+        yy, mm, dd = int(self.name[1:3]), int(self.name[3:5]), int(self.name[5:7])
+        self.date = datetime.date(2000 + yy if yy < 80 else 1900 + yy, mm, dd)
+        self.esd = float(earth_sun_au(self.date.timetuple().tm_yday))
+
+    def sample_obs(self, step=7):
+        o = np.asarray(self.obs[::step, :, ::step]).transpose(0, 2, 1).reshape(-1, self.obs.shape[1])
+        return o[o[:, 0] > 0]
+
+    def block(self, r0, r1):
+        dn = np.asarray(self.rdn[r0:r1]).reshape(-1, self.nb).astype(np.float64)
+        g = np.asarray(self.obs[r0:r1], np.float64).transpose(0, 2, 1).reshape(-1, self.obs.shape[1])
+        ok = (dn[:, [10, 50, 150]] > 0).all(1) & (g[:, 0] > 0)
+        return dn / self.gain, g[:, :5], ok
+
+
+def classic_geometry(folder):
+    """Median ground elevation (IGM) and sensor altitude (ephemeris) [km] of a Classic line."""
+    d = Path(folder)
+    igm = next(d.glob("*_ort_igm"))
+    _, h, _ = read_header(str(igm) + ".hdr")
+    nl, ns = int(h["lines"]), int(h["samples"])
+    il = h.get("interleave", "bil").lower()
+    a = np.memmap(igm, "<f8", "r", shape=(nl, 3, ns) if il == "bil" else (nl, ns, 3))
+    z = np.asarray(a[::5, 2, ::5] if il == "bil" else a[::5, ::5, 2]).ravel()
+    z = z[(z > -500) & (z < 9000)]
+    eph = np.fromfile(next(p for p in d.glob("*_eph") if "lonlat" not in p.name), "<f8").reshape(-1, 6)
+    return float(np.median(z)) / 1000.0, float(np.median(eph[:, 2])) / 1000.0
+
+
+def open_radiance(path, obs=None):
+    p = Path(path)
+    if p.is_dir():
+        return ClassicReader(p)
+    return NGReader(p, obs)
 
 
 # ---------------------------------------------------------------- once per scene
 class Scene:
     """Everything that does not depend on the pixel."""
 
-    def __init__(self, centers, fwhm, taudirs, ground_km, sensor_km, sza, doy_esd, vza_nodes, dphi_nodes,
-                 shift=(0.389, 0.063e-3), o3_du=None, aer=None, aod=None, aod_ref=550.0,
-                 pressure_ratio=1.0, ws=np.linspace(0.1, 2.5, 40), co2_ppm=None, log=print):
+    def __init__(self, centers, fwhm, taudirs, ground_km, sensor_km, sza, esd, vza_nodes, dphi_nodes,
+                 shift=(0.389, 0.063e-3), L_med=None, o3_du=None, aer=None, aod=None, aod_ref=550.0,
+                 pressure_ratio=1.0, ws=np.linspace(0.1, 2.5, 40), year=2020, log=print):
         self.c, self.f = np.asarray(centers, float), np.asarray(fwhm, float)
-        self.shift = shift[0] + shift[1] * (self.c - 1500)
         self.ws, self.vza = np.asarray(ws, float), np.asarray(vza_nodes, float)
         self.dphi = np.asarray(dphi_nodes, float)
         self.mu_s = np.cos(np.radians(sza))
-        self.esd = doy_esd
+        self.esd = esd
         prof = atmosphere.load_afgl(str(AFGL))
         self.L = atmosphere.layers(prof, surface_km=ground_km, sensor_km=sensor_km)
         self.L["air"] = self.L["air"] * pressure_ratio
         self.cm1 = atmosphere.layers(prof, ground_km)["col"]["H2O"].sum() * H2O_CM
         groups = {"all": np.ones(len(self.L["p"]), bool), "below": self.L["below_sensor"]}
-        if co2_ppm is None:
-            co2_ppm = atmosphere.co2_ppm(2020)
         t0 = time.time()
-        wn, E, dry_all, dry_below, wet_all, wet_below = self._fine(taudirs, groups, co2_ppm / 330.2, o3_du)
+        wn, E, dry_all, dry_below, wet_all, wet_below = self._fine(taudirs, groups,
+                                                                   atmosphere.co2_ppm(year) / 330.2, o3_du)
         log(f"fine grid: {len(wn)} points, {time.time() - t0:.0f}s")
+        mu_v = np.cos(np.radians(self.vza[len(self.vza) // 2]))
+        if isinstance(shift, str) and shift == "fit":
+            t0 = time.time()
+            self.shift, self.shift_fit = self._fit_shift(wn, E, dry_all, dry_below, wet_all, wet_below,
+                                                         mu_v, L_med)
+            log(f"shift fit ({time.time() - t0:.0f}s): " + "; ".join(
+                f"{k}: {v['shift']:+.2f} nm" + (f" ({v['from']})" if 'from' in v else "")
+                for k, v in self.shift_fit.items()))
+        else:
+            self.shift = shift[0] + shift[1] * (self.c - 1500)
+            self.shift_fit = None
         # gas table: ln band<E T> over (view node, water scale, band)
         t0 = time.time()
         lnET = np.empty((len(self.vza), len(self.ws), len(self.c)))
@@ -124,20 +233,26 @@ class Scene:
         sun_only = instrument.convolve(1e7 / t[::-1, 0], t[::-1, 1], self.c, self.f, self.shift)
         self.E_band = sun_only
         for i, v in enumerate(self.vza):
-            mu_v = np.cos(np.radians(v))
-            dry = np.exp(-(dry_all / self.mu_s + dry_below / mu_v)) * E
-            wet = wet_all / self.mu_s + wet_below / mu_v
+            mv = np.cos(np.radians(v))
+            dry = np.exp(-(dry_all / self.mu_s + dry_below / mv)) * E
+            wet = wet_all / self.mu_s + wet_below / mv
             for j, w in enumerate(self.ws):
                 m = instrument.convolve(wn, dry * np.exp(-w * wet), self.c, self.f, self.shift)
                 m = np.where(inside & np.isfinite(m), m, sun_only)
-                lnET[i, j] = np.log(m)
+                lnET[i, j] = np.log(np.maximum(m, 1e-30))
         self.lnET = lnET
         log(f"gas table {lnET.shape}: {time.time() - t0:.0f}s")
-        # scattering terms per view node
         t0 = time.time()
         self.scat = self._scattering(aer, aod, aod_ref)
         log(f"scattering {len(SCAT_GRID)} wavelengths x {len(self.vza)} x {len(self.dphi)} geometries: "
             f"{time.time() - t0:.0f}s")
+
+    def transmittance(self, w):
+        """Two-way gas transmittance per band at water scale w (middle view node)."""
+        j, f = _bracket(self.ws, np.array([w]))
+        i = len(self.vza) // 2
+        ln = self.lnET[i, j[0]] * (1 - f[0]) + self.lnET[i, j[0] + 1] * f[0]
+        return np.exp(ln) / self.E_band
 
     def _fine(self, taudirs, groups, co2_scale, o3_du):
         segs = []
@@ -164,6 +279,47 @@ class Scene:
         t = np.loadtxt(TSIS)
         E = np.interp(1e7 / wn, t[:, 0], t[:, 1])
         return wn, E, s["da"], s["db"], s["wa"], s["wb"]
+
+    def _fit_shift(self, wn, E, dry_all, dry_below, wet_all, wet_below, mu_v, L_med):
+        """One shift per spectrometer from the scene's median radiance: minimise the roughness
+        (rms 2nd difference / median) of the gas-corrected spectrum across O2 / CO2 bands."""
+        assert L_med is not None, "shift fit needs the scene's median radiance"
+        y = np.exp(-(dry_all / self.mu_s + dry_below / mu_v)) * E * np.exp(-(wet_all / self.mu_s + wet_below / mu_v))
+        bounds = [0] + instrument.seams(self.c) + [len(self.c)]
+        shifts = np.full(len(self.c), np.nan)
+        info, cand = {}, np.round(np.arange(-2.0, 2.001, 0.1), 2)
+        for a, b in zip(bounds[:-1], bounds[1:]):
+            name = f"{self.c[a]:.0f}-{self.c[b - 1]:.0f} nm"
+            idx = np.arange(a, b)
+            wins = [idx[(self.c[idx] >= lo) & (self.c[idx] <= hi)] for lo, hi in SHIFT_WINDOWS.values()]
+            wins = [w for w in wins if len(w) >= 4]
+            if not wins:
+                info[name] = None
+                continue
+            sel = np.concatenate(wins)
+            cost = []
+            for s in cand:
+                m = instrument.convolve(wn, y, self.c[sel], self.f[sel], s)
+                r = L_med[sel] / m
+                parts, k = [], 0
+                for w in wins:
+                    q = r[k:k + len(w)]; k += len(w)
+                    parts.append(np.sqrt(np.mean(np.diff(q, 2) ** 2)) / np.median(q))
+                cost.append(np.sqrt(np.mean(np.square(parts))))
+            cost = np.array(cost); j = int(np.clip(np.argmin(cost), 1, len(cand) - 2))
+            den = cost[j - 1] - 2 * cost[j] + cost[j + 1]
+            s = cand[j] + (0.5 * (cost[j - 1] - cost[j + 1]) / den * 0.1 if den > 0 else 0.0)
+            shifts[a:b] = s
+            info[name] = dict(shift=float(s), roughness_pct=float(100 * cost.min()),
+                              windows=[k for k, (lo, hi) in SHIFT_WINDOWS.items()
+                                       if any((self.c[idx] >= lo) & (self.c[idx] <= hi))])
+        fitted = [(a, b) for a, b in zip(bounds[:-1], bounds[1:]) if np.isfinite(shifts[a])]
+        for (a, b), name in zip(zip(bounds[:-1], bounds[1:]), list(info)):
+            if info[name] is None:                    # nearest fitted spectrometer
+                na, nb_ = min(fitted, key=lambda ab: abs(ab[0] - a))
+                shifts[a:b] = shifts[na]
+                info[name] = dict(shift=float(shifts[na]), **{"from": f"{self.c[na]:.0f}-{self.c[nb_ - 1]:.0f} nm"})
+        return shifts, info
 
     def _scattering(self, aer, aod, ref):
         L = self.L
@@ -256,36 +412,48 @@ def correct_block(sc, Lrad, vza, dphi, sza_px, good):
 
 def relative_azimuth(vaz, saz):
     """|view azimuth - (sun azimuth + 180)| folded into [0, 180] degrees."""
-    d = np.abs(((vaz - (saz + 180.0)) + 180.0) % 360.0 - 180.0)
-    return d
+    return np.abs(((vaz - (saz + 180.0)) + 180.0) % 360.0 - 180.0)
 
 
-def run(rdn_hdr, obs_hdr, out_prefix, scene_kw, rows=64, log=print, max_lines=None, bbl_from=None):
-    text, hdr, arr = read_header(rdn_hdr)
-    centers, fwhm = arr("wavelength"), arr("fwhm")
-    nl, nb, ns = int(hdr["lines"]), int(hdr["bands"]), int(hdr["samples"])
-    rdn, _ = open_bil(rdn_hdr)
-    obs, il = open_bil(obs_hdr)
-    if max_lines:                                  # quick test on the first lines
-        nl = min(nl, max_lines); rdn, obs = rdn[:nl], obs[:nl]
-        text = re.sub(r"^lines\s*=.*$", f"lines = {nl}", text, flags=re.M)
-    assert il == "bip"
-    # scene geometry from the ortho obs (valid pixels)
-    o = np.asarray(obs[::7, ::7, :]).reshape(-1, obs.shape[2])
-    o = o[o[:, 0] > 0]
-    sza, esd = float(np.median(o[:, 4])), float(np.median(o[:, 10]))
+def core_opaque(centers):
+    c = np.asarray(centers, float)
+    out = np.zeros(len(c), bool)
+    for lo, hi in CORE_OPAQUE_NM:
+        out |= (c >= lo) & (c <= hi)
+    return out
+
+
+def median_radiance(rd, n=4000, seed=0):
+    """Median radiance of up to n valid pixels spread over the scene (for seams and the shift fit)."""
+    rng = np.random.default_rng(seed)
+    rows = np.sort(rng.choice(rd.nl, min(rd.nl, 200), replace=False))
+    picks = []
+    for r in rows:
+        L, _, ok = rd.block(r, r + 1)
+        if ok.any():
+            picks.append(L[ok][rng.choice(ok.sum(), min(ok.sum(), max(1, n // len(rows))), replace=False)])
+    return np.median(np.concatenate(picks), 0)
+
+
+# ---------------------------------------------------------------- whole scene
+def run(radiance, out_prefix, scene_kw, obs=None, rows=64, log=print, lines=None, bbl_from=None):
+    rd = open_radiance(radiance, obs)
+    nl, nb, ns = rd.nl, rd.nb, rd.ns
+    r_lo, r_hi = (0, nl) if not lines else (max(0, lines[0]), min(nl, lines[1]))
+    o = rd.sample_obs()
+    sza = float(np.median(o[:, 4]))
     vmax = float(np.max(o[:, 2]))
     vza_nodes = np.linspace(0, max(vmax, 1.0) + 0.5, 3)
     dphi_nodes = np.array([0.0, 90.0, 180.0])
-    log(f"scene: {nl} x {ns} px, {nb} bands; sza {sza:.2f}, view zenith up to {vmax:.1f}, esd {esd:.5f}")
-    sc = Scene(centers, fwhm, sza=sza, doy_esd=esd, vza_nodes=vza_nodes, dphi_nodes=dphi_nodes, log=log, **scene_kw)
-    good = np.ones(nb, bool)
-    if "bbl" in hdr:
-        good = arr("bbl") > 0
-    good &= (centers > 395)
-    # seams (AVIRIS Classic has three; reported, never corrected)
-    med = np.nanmedian(np.where(np.asarray(rdn[nl // 2, :, :]).T > 0, np.asarray(rdn[nl // 2, :, :]).T, np.nan), 0)
-    seams = instrument.seam_check(centers, fwhm, med, sc.E_band)
+    log(f"{rd.name}: {nl} x {ns} px, {nb} bands, rows {r_lo}-{r_hi}; sza {sza:.2f}, "
+        f"view zenith up to {vmax:.1f}, Earth-Sun {rd.esd:.5f} AU")
+    L_med = median_radiance(rd)
+    k_med = np.pi * rd.esd ** 2 / np.cos(np.radians(sza))
+    sc = Scene(rd.centers, rd.fwhm, sza=sza, esd=rd.esd, vza_nodes=vza_nodes, dphi_nodes=dphi_nodes,
+               L_med=k_med * L_med * 10.0, log=log, **scene_kw)
+    good = (rd.bbl > 0) if rd.bbl is not None else np.ones(nb, bool)
+    good &= (rd.centers > 395)
+    seams = instrument.seam_check(rd.centers, rd.fwhm, L_med, sc.E_band)
     log("seams: " + ("none (single spectrometer)" if not seams else
                      "; ".join(f"{s['ends_nm']:.0f}|{s['starts_nm']:.0f} ratio {s['ratio']:.4f}"
                                f"{' FLAG' if s['flagged'] else ''}{' low-signal' if s['low_signal'] else ''}"
@@ -294,15 +462,14 @@ def run(rdn_hdr, obs_hdr, out_prefix, scene_kw, rows=64, log=print, max_lines=No
     Path(out_prefix).parent.mkdir(parents=True, exist_ok=True)
     out_img = Path(str(out_prefix) + "_rfl_img")
     wat_img = Path(str(out_prefix) + "_h2o_img")
-    rfl = np.memmap(out_img, "<f4", "w+", shape=(nl, nb, ns))
-    wat = np.memmap(wat_img, "<f4", "w+", shape=(nl, 3, ns))
+    n_out = r_hi - r_lo
+    rfl = np.memmap(out_img, "<f4", "w+", shape=(n_out, nb, ns))
+    wat = np.memmap(wat_img, "<f4", "w+", shape=(n_out, 3, ns))
     t0 = time.time()
     stats = []
-    for r0 in range(0, nl, rows):
-        r1 = min(nl, r0 + rows)
-        L = np.asarray(rdn[r0:r1], np.float64).transpose(0, 2, 1).reshape(-1, nb)   # (P, B)
-        g = np.asarray(obs[r0:r1], np.float64).reshape(-1, obs.shape[2])
-        ok = (L[:, 0] > -9000) & (g[:, 0] > 0) & (np.nanmax(L, 1) > 0)
+    for r0 in range(r_lo, r_hi, rows):
+        r1 = min(r_hi, r0 + rows)
+        L, g, ok = rd.block(r0, r1)
         R = np.full((len(L), nb), -9999.0, np.float32)
         W = np.full((len(L), 3), -9999.0, np.float32)
         if ok.any():
@@ -311,51 +478,77 @@ def run(rdn_hdr, obs_hdr, out_prefix, scene_kw, rows=64, log=print, max_lines=No
             R[ok] = rho
             W[ok] = np.c_[w940 * sc.cm1, w1140 * sc.cm1, rms]
             stats.append(np.c_[w940, w1140])
-        rfl[r0:r1] = R.reshape(r1 - r0, ns, nb).transpose(0, 2, 1)
-        wat[r0:r1] = W.reshape(r1 - r0, ns, 3).transpose(0, 2, 1)
-        if (r0 // rows) % 8 == 0:
+        rfl[r0 - r_lo:r1 - r_lo] = R.reshape(r1 - r0, ns, nb).transpose(0, 2, 1)
+        wat[r0 - r_lo:r1 - r_lo] = W.reshape(r1 - r0, ns, 3).transpose(0, 2, 1)
+        if ((r0 - r_lo) // rows) % 16 == 0:
             el = time.time() - t0
-            log(f"rows {r1}/{nl}  {el / 60:.1f} min  eta {el / r1 * (nl - r1) / 60:.1f} min")
+            log(f"rows {r1 - r_lo}/{n_out}  {el / 60:.1f} min  eta {el / (r1 - r_lo) * (r_hi - r1) / 60:.1f} min")
     rfl.flush(); wat.flush()
-    extra = None
-    if bbl_from and "bbl" not in hdr:   # the data provider's bad-band list (never invented here)
-        _, h2, a2 = read_header(bbl_from)
-        assert np.allclose(a2("wavelength"), centers), "bbl source has a different band table"
-        extra = {"bbl": h2["bbl"]}
-    write_header(str(out_img) + ".hdr", text, "DUSTRAN surface reflectance (Lambertian, plane-parallel)",
-                 extra=extra)
-    write_header(str(wat_img) + ".hdr", text, "DUSTRAN water column", bands=3,
-                 band_names=["water 940 (cm)", "water 1140 (cm)", "940 fit rms (%)"])
     s = np.concatenate(stats)
     rel = (s[:, 1] - s[:, 0]) / s[:, 0]
+
+    # bad-band list: provider > this scene > conservative default
+    if rd.bbl is not None:
+        bbl, bbl_src = rd.bbl, "provider (radiance header)"
+    elif bbl_from:
+        _, h2, a2 = read_header(bbl_from)
+        assert len(a2("wavelength")) == nb and np.allclose(a2("wavelength"), rd.centers, atol=0.5), \
+            "bbl source has a different band table"
+        bbl, bbl_src = a2("bbl"), f"provider ({Path(bbl_from).name})"
+    else:
+        T = sc.transmittance(float(np.median(s[:, 0])))
+        opaque = T < OPAQUE_T
+        if opaque.any():
+            bbl, bbl_src = (~opaque).astype(float), f"scene (two-way gas transmittance < {OPAQUE_T:.0%} at median water)"
+        else:
+            bbl, bbl_src = (~core_opaque(rd.centers)).astype(float), "conservative default"
+    log(f"bbl: {int((bbl == 0).sum())} bands off, from {bbl_src}")
+
+    # map info of a row subset: shift the reference pixel
+    mi = rd.map_info
+    if mi and r_lo:
+        p = [x.strip() for x in mi.strip("{}").split(",")]
+        p[2] = str(float(p[2]) - r_lo)
+        mi = "{" + ", ".join(p) + "}"
+    write_header(str(out_img) + ".hdr", ns, n_out, "DUSTRAN surface reflectance (Lambertian, plane-parallel)",
+                 mi, rd.centers, rd.fwhm, bbl, coord=rd.coord)
+    write_header(str(wat_img) + ".hdr", ns, n_out, "DUSTRAN water column", mi,
+                 band_names=["water 940 (cm)", "water 1140 (cm)", "940 fit rms (%)"], coord=rd.coord)
     summary = dict(
-        radiance=str(rdn_hdr), reflectance=str(out_img) + ".hdr", water=str(wat_img) + ".hdr",
-        sza=sza, esd=esd, vza_nodes=vza_nodes.tolist(), afgl_water_cm=sc.cm1,
+        radiance=str(radiance), reflectance=str(out_img) + ".hdr", water=str(wat_img) + ".hdr",
+        rows=[r_lo, r_hi], sza=sza, esd=rd.esd, vza_nodes=vza_nodes.tolist(), afgl_water_cm=sc.cm1,
+        shift=(sc.shift_fit if sc.shift_fit else
+               dict(zip(["A", "B"], map(float, scene_kw.get("shift", (0.389, 0.063e-3)))))),
+        bbl_source=bbl_src, bbl_off_nm=[float(x) for x in rd.centers[bbl == 0]],
         water_940_cm_pct=dict(zip(["p5", "p50", "p95"], (np.percentile(s[:, 0], [5, 50, 95]) * sc.cm1).tolist())),
         water_1140_cm_pct=dict(zip(["p5", "p50", "p95"], (np.percentile(s[:, 1], [5, 50, 95]) * sc.cm1).tolist())),
         water_1140_vs_940_median_rel=float(np.median(rel)),
         water_flag_frac_gt10pct=float(np.mean(np.abs(rel) > 0.10)),
         water_flag=bool(abs(np.median(rel)) > 0.10),
         seams=[{k: v for k, v in x.items() if k != "pairs"} for x in seams],
+        seam_flagged=any(x["flagged"] for x in seams),
         minutes=(time.time() - t0) / 60,
         **{k: (v if isinstance(v, (int, float, str, list)) else str(v)) for k, v in scene_kw.items()
-           if k not in ("aer",)})
+           if k not in ("aer", "shift")})
     Path(str(out_prefix) + "_summary.json").write_text(json.dumps(summary, indent=1))
     log(json.dumps({k: summary[k] for k in ("water_940_cm_pct", "water_1140_cm_pct",
                                              "water_1140_vs_940_median_rel", "water_flag", "minutes")}))
     return summary
 
 
-if __name__ == "__main__":
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("rdn_hdr"); ap.add_argument("obs_hdr"); ap.add_argument("out_prefix")
+    ap.add_argument("radiance", help="AVIRIS-NG *_img.hdr, or an AVIRIS Classic rdn folder")
+    ap.add_argument("out_prefix")
+    ap.add_argument("--obs", help="AVIRIS-NG *_obs_ort.hdr")
     ap.add_argument("--taudirs", required=True, help="comma-separated line-by-line tau folders")
     ap.add_argument("--ground", type=float, required=True, help="ground elevation [km] (gas tau run)")
     ap.add_argument("--sensor", type=float, required=True, help="sensor altitude [km] (gas tau run)")
+    ap.add_argument("--year", type=int, default=2020, help="flight year (CO2)")
     ap.add_argument("--o3-du", type=float, default=None, help="measured ozone column [DU]")
     ap.add_argument("--pressure-ratio", type=float, default=1.0, help="scale the air column (Rayleigh, CIA)")
-    ap.add_argument("--shift", nargs=2, type=float, default=[0.389, 0.063e-3],
-                    help="band shift A + B (nm - 1500) [nm]")
+    ap.add_argument("--shift", nargs="+", default=["0.389", "0.063e-3"],
+                    help="band shift A B [nm, + B (nm - 1500)], or 'fit' to fit per spectrometer")
     ap.add_argument("--aeronet", help="AERONET folder (SIZ_hyb.txt, RIN_hyb.txt, aod file)")
     ap.add_argument("--aeronet-aod-file", default="aod.txt")
     ap.add_argument("--inv-time"); ap.add_argument("--sun-time"); ap.add_argument("--date")
@@ -363,10 +556,11 @@ if __name__ == "__main__":
     ap.add_argument("--angstrom", type=float, default=1.2)
     ap.add_argument("--rows", type=int, default=64)
     ap.add_argument("--bbl-from", help="header whose bad-band list (bbl) to copy, e.g. the provider's reflectance product")
-    ap.add_argument("--max-lines", type=int, default=None, help="process only the first N lines (testing)")
-    a = ap.parse_args()
+    ap.add_argument("--lines", nargs=2, type=int, default=None, help="process only rows R0..R1 (testing)")
+    a = ap.parse_args(argv)
+    shift = "fit" if a.shift[0] == "fit" else tuple(map(float, a.shift))
     kw = dict(taudirs=a.taudirs.split(","), ground_km=a.ground, sensor_km=a.sensor, o3_du=a.o3_du,
-              pressure_ratio=a.pressure_ratio, shift=tuple(a.shift))
+              pressure_ratio=a.pressure_ratio, shift=shift, year=a.year)
     if a.aeronet:
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "experiments"))
         import aeronet_aerosol
@@ -375,4 +569,9 @@ if __name__ == "__main__":
         print(f"AERONET: AOD500 {meas[500]:.3f}, photometer water {meas['PW']:.3f} cm")
     elif a.aod:
         kw.update(aer=aerosol.Dust.fit_angstrom(a.angstrom), aod=a.aod, aod_ref=550.0)
-    run(a.rdn_hdr, a.obs_hdr, a.out_prefix, kw, rows=a.rows, log=lambda s: print(s, flush=True), max_lines=a.max_lines, bbl_from=a.bbl_from)
+    return run(a.radiance, a.out_prefix, kw, obs=a.obs, rows=a.rows, log=lambda s: print(s, flush=True),
+               lines=a.lines, bbl_from=a.bbl_from)
+
+
+if __name__ == "__main__":
+    main()
