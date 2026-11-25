@@ -100,6 +100,19 @@ transmittance makes opaque), a water map and a JSON summary. An AVIRIS-NG line (
 takes ~4 min of set-up and ~7 min of correction. On the 2019 AVIRIS Classic Railroad Valley line
 it reproduces the validated playa result (experiments/classic_playa.py) within 1 % in every range.
 
+Humid scenes: raise the top of the per-pixel water table with `--water-max` (default 2.5 times
+the standard profile).
+
+### 7. Station check
+
+```
+python -m dustran.stations SCENE_FOLDER OUT/prefix_summary.json [--km 200] [--minutes 60]
+```
+
+Compares the run's assumed aerosol and its 940 nm water with AERONET sun-photometer points
+within 200 km and 60 minutes of the overpass, and adds the result to the summary JSON. The
+numbers are reported, never fed back into the run. See `docs/station_checks.md`.
+
 Status: research code. See `STACK.md` for the design and each layer's status, `RESULTS.md` for
-what has been validated, `PROVENANCE.md` for where every piece came from and its license, and
+what has been validated, `KNOWN_ISSUES.md` for open problems found on real scenes, `PROVENANCE.md` for where every piece came from and its license, and
 `BIBLIOGRAPHY.md` for the published work it is built on.

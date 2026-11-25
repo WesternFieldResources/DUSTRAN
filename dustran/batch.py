@@ -563,13 +563,16 @@ def main(argv=None):
     ap.add_argument("--inv-time"); ap.add_argument("--sun-time"); ap.add_argument("--date")
     ap.add_argument("--aod", type=float, default=None, help="AOD at 550 nm (lognormal dust, Angstrom below)")
     ap.add_argument("--angstrom", type=float, default=1.2)
+    ap.add_argument("--water-max", type=float, default=2.5,
+                    help="top of the per-pixel water table, as a multiple of the standard profile (humid scenes need more)")
     ap.add_argument("--rows", type=int, default=64)
     ap.add_argument("--bbl-from", help="header whose bad-band list (bbl) to copy, e.g. the provider's reflectance product")
     ap.add_argument("--lines", nargs=2, type=int, default=None, help="process only rows R0..R1 (testing)")
     a = ap.parse_args(argv)
     shift = "fit" if a.shift[0] == "fit" else tuple(map(float, a.shift))
     kw = dict(taudirs=a.taudirs.split(","), ground_km=a.ground, sensor_km=a.sensor, o3_du=a.o3_du,
-              pressure_ratio=a.pressure_ratio, shift=shift, year=a.year)
+              pressure_ratio=a.pressure_ratio, shift=shift, year=a.year,
+              ws=np.linspace(0.1, a.water_max, 40 if a.water_max <= 2.5 else int(np.ceil(40 * a.water_max / 2.5))))
     if a.aeronet:
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "experiments"))
         import aeronet_aerosol
