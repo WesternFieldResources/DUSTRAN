@@ -224,6 +224,9 @@ class Scene:
             log(f"shift fit ({time.time() - t0:.0f}s): " + "; ".join(
                 f"{k}: {v['shift']:+.2f} nm" + (f" (from {v['from']}; FLAG {v['flag']})" if 'from' in v else "")
                 for k, v in self.shift_fit.items()))
+        elif isinstance(shift, np.ndarray):                # per-band shift (dustran.selfcal)
+            self.shift = np.asarray(shift, float)
+            self.shift_fit = None
         else:
             self.shift = shift[0] + shift[1] * (self.c - 1500)
             self.shift_fit = None
@@ -396,18 +399,33 @@ def fit_water(sc, r0, iv, fv, window, good):
     return sc.ws[j] + d * step, 100 * np.min(cost, 1)
 
 
-def correct_block(sc, Lrad, vza, dphi, sza_px, good):
+def _lnm(sc, iv, fv, w):
+    """ln band<E T> at view (iv, fv) and water scale w, and its derivative d/dw. (P, B) each."""
+    T = sc.lnET
+    jw, fw = _bracket(sc.ws, w)
+    lo = T[iv, jw] * (1 - fv[:, None]) + T[iv + 1, jw] * fv[:, None]
+    hi = T[iv, jw + 1] * (1 - fv[:, None]) + T[iv + 1, jw + 1] * fv[:, None]
+    return lo * (1 - fw[:, None]) + hi * fw[:, None], (hi - lo) / (sc.ws[1] - sc.ws[0])
+
+
+def correct_block(sc, Lrad, vza, dphi, sza_px, good, wi=None):
     """Lrad (P, B) radiance [uW cm-2 sr-1 nm-1]; vza, dphi, sza_px (P,). Returns rho (P,B),
-    water scale at 940 and 1140 (P,), 940 fit rms %."""
+    water scale at 940 and 1140 (P,), 940 fit rms %, and (with wi, a wateriron.WaterIron) a dict
+    with the water after the water-or-iron fit and the iron coefficients."""
     k = np.pi * sc.esd ** 2 / np.cos(np.radians(sza_px))
     r0 = k[:, None] * Lrad * 10.0                      # uW cm-2 -> mW m-2 (TSIS units)
     iv, fv = _bracket(sc.vza, vza)
     w940, rms940 = fit_water(sc, r0, iv, fv, WATER["940"], good)
     w1140, _ = fit_water(sc, r0, iv, fv, WATER["1140"], good)
-    jw, fw = _bracket(sc.ws, w940)
-    T = sc.lnET
-    lnm = ((T[iv, jw] * (1 - fw[:, None]) + T[iv, jw + 1] * fw[:, None]) * (1 - fv[:, None])
-           + (T[iv + 1, jw] * (1 - fw[:, None]) + T[iv + 1, jw + 1] * fw[:, None]) * fv[:, None])
+    w, extra = w940, None
+    if wi is not None:
+        ln_r0 = np.log(np.maximum(r0, 1e-12))
+        for _ in range(wi.iterations):
+            lnm, g = _lnm(sc, iv, fv, w)
+            a, b, rr = wi.fit(ln_r0 - lnm, g)      # ln r_est = ln r_true + g (w_true - w_est)
+            w = np.clip(w + a, sc.ws[0], sc.ws[-1])
+        extra = dict(w=w, b=b, rms=rr)
+    lnm, _ = _lnm(sc, iv, fv, w)
     r = r0 * np.exp(-lnm)
     ip, fp = _bracket(sc.dphi, dphi)
     S4 = sc.scat
@@ -416,7 +434,7 @@ def correct_block(sc, Lrad, vza, dphi, sza_px, good):
              + (S4[iv + 1, ip] * (1 - wp) + S4[iv + 1, ip + 1] * wp) * wv)     # (P, 4, B)
     x = r - terms[:, 0]
     rho = x / (terms[:, 1] + terms[:, 2] * x)
-    return rho, w940, w1140, rms940
+    return (rho, w940, w1140, rms940) if wi is None else (rho, w940, w1140, rms940, extra)
 
 
 def relative_azimuth(vaz, saz):
@@ -445,8 +463,18 @@ def median_radiance(rd, n=4000, seed=0):
 
 
 # ---------------------------------------------------------------- whole scene
-def run(radiance, out_prefix, scene_kw, obs=None, rows=64, log=print, lines=None, bbl_from=None):
+def run(radiance, out_prefix, scene_kw, obs=None, rows=64, log=print, lines=None, bbl_from=None, selfcal=None,
+        water_iron=False):
     rd = open_radiance(radiance, obs)
+    model_fwhm = rd.fwhm
+    if selfcal:
+        from dustran import selfcal as _sc
+        sc_json = json.loads(Path(selfcal).read_text())
+        shift_b, model_fwhm = _sc.apply(sc_json, rd.centers, rd.fwhm)
+        scene_kw = dict(scene_kw, shift=shift_b)
+        log("selfcal " + Path(selfcal).name + ": " + "; ".join(
+            f"{k} {v['offset_nm']:+.2f} nm {v['slope_nm_per_100nm']:+.2f}/100 nm width x{v['width_scale']:.3f}"
+            for k, v in sc_json["spectrometers"].items()))
     nl, nb, ns = rd.nl, rd.nb, rd.ns
     r_lo, r_hi = (0, nl) if not lines else (max(0, lines[0]), min(nl, lines[1]))
     o = rd.sample_obs()
@@ -458,7 +486,7 @@ def run(radiance, out_prefix, scene_kw, obs=None, rows=64, log=print, lines=None
         f"view zenith up to {vmax:.1f}, Earth-Sun {rd.esd:.5f} AU")
     L_med = median_radiance(rd)
     k_med = np.pi * rd.esd ** 2 / np.cos(np.radians(sza))
-    sc = Scene(rd.centers, rd.fwhm, sza=sza, esd=rd.esd, vza_nodes=vza_nodes, dphi_nodes=dphi_nodes,
+    sc = Scene(rd.centers, model_fwhm, sza=sza, esd=rd.esd, vza_nodes=vza_nodes, dphi_nodes=dphi_nodes,
                L_med=k_med * L_med * 10.0, log=log, **scene_kw)
     good = (rd.bbl > 0) if rd.bbl is not None else np.ones(nb, bool)
     good &= (rd.centers > 395)
@@ -473,22 +501,36 @@ def run(radiance, out_prefix, scene_kw, obs=None, rows=64, log=print, lines=None
     wat_img = Path(str(out_prefix) + "_h2o_img")
     n_out = r_hi - r_lo
     rfl = np.memmap(out_img, "<f4", "w+", shape=(n_out, nb, ns))
-    wat = np.memmap(wat_img, "<f4", "w+", shape=(n_out, 3, ns))
+    nw = 6 if water_iron else 3
+    wat = np.memmap(wat_img, "<f4", "w+", shape=(n_out, nw, ns))
+    wi = None
+    if water_iron:
+        from dustran.wateriron import WaterIron
+        wi = WaterIron(rd.centers, good)
+        log(f"water-or-iron fit: {wi.sel.sum()} bands {rd.centers[wi.sel].min():.0f}-{rd.centers[wi.sel].max():.0f} nm, "
+            f"references: {', '.join(wi.names)}")
     t0 = time.time()
     stats = []
     for r0 in range(r_lo, r_hi, rows):
         r1 = min(r_hi, r0 + rows)
         L, g, ok = rd.block(r0, r1)
         R = np.full((len(L), nb), -9999.0, np.float32)
-        W = np.full((len(L), 3), -9999.0, np.float32)
+        W = np.full((len(L), nw), -9999.0, np.float32)
         if ok.any():
-            rho, w940, w1140, rms = correct_block(sc, L[ok], g[ok, 2], relative_azimuth(g[ok, 1], g[ok, 3]),
-                                                  g[ok, 4], good)
+            out = correct_block(sc, L[ok], g[ok, 2], relative_azimuth(g[ok, 1], g[ok, 3]), g[ok, 4], good, wi)
+            rho, w940, w1140, rms = out[:4]
             R[ok] = rho
-            W[ok] = np.c_[w940 * sc.cm1, w1140 * sc.cm1, rms]
-            stats.append(np.c_[w940, w1140])
+            if wi is None:
+                W[ok] = np.c_[w940 * sc.cm1, w1140 * sc.cm1, rms]
+                stats.append(np.c_[w940, w1140])
+            else:
+                e = out[4]
+                fer = e["b"][:, [i for i, n in enumerate(wi.names) if n.startswith("ferric")]].sum(1)
+                fes = e["b"][:, [i for i, n in enumerate(wi.names) if n.startswith("ferrous")]].sum(1)
+                W[ok] = np.c_[w940 * sc.cm1, w1140 * sc.cm1, rms, e["w"] * sc.cm1, fer, fes]
+                stats.append(np.c_[w940, w1140, e["w"]])
         rfl[r0 - r_lo:r1 - r_lo] = R.reshape(r1 - r0, ns, nb).transpose(0, 2, 1)
-        wat[r0 - r_lo:r1 - r_lo] = W.reshape(r1 - r0, ns, 3).transpose(0, 2, 1)
+        wat[r0 - r_lo:r1 - r_lo] = W.reshape(r1 - r0, ns, nw).transpose(0, 2, 1)
         if ((r0 - r_lo) // rows) % 16 == 0:
             el = time.time() - t0
             log(f"rows {r1 - r_lo}/{n_out}  {el / 60:.1f} min  eta {el / (r1 - r_lo) * (r_hi - r1) / 60:.1f} min")
@@ -522,11 +564,14 @@ def run(radiance, out_prefix, scene_kw, obs=None, rows=64, log=print, lines=None
     write_header(str(out_img) + ".hdr", ns, n_out, "DUSTRAN surface reflectance (Lambertian, plane-parallel)",
                  mi, rd.centers, rd.fwhm, bbl, coord=rd.coord)
     write_header(str(wat_img) + ".hdr", ns, n_out, "DUSTRAN water column", mi,
-                 band_names=["water 940 (cm)", "water 1140 (cm)", "940 fit rms (%)"], coord=rd.coord)
+                 band_names=["water 940 (cm)", "water 1140 (cm)", "940 fit rms (%)"] +
+                 (["water after water-or-iron fit (cm)", "ferric coefficient", "ferrous coefficient"] if wi else []),
+                 coord=rd.coord)
     summary = dict(
         radiance=str(radiance), reflectance=str(out_img) + ".hdr", water=str(wat_img) + ".hdr",
         rows=[r_lo, r_hi], sza=sza, esd=rd.esd, vza_nodes=vza_nodes.tolist(), afgl_water_cm=sc.cm1,
         shift=(sc.shift_fit if sc.shift_fit else
+               {"selfcal": str(selfcal)} if selfcal else
                dict(zip(["A", "B"], map(float, scene_kw.get("shift", (0.389, 0.063e-3)))))),
         bbl_source=bbl_src, bbl_off_nm=[float(x) for x in rd.centers[bbl == 0]],
         water_940_cm_pct=dict(zip(["p5", "p50", "p95"], (np.percentile(s[:, 0], [5, 50, 95]) * sc.cm1).tolist())),
@@ -534,6 +579,10 @@ def run(radiance, out_prefix, scene_kw, obs=None, rows=64, log=print, lines=None
         water_1140_vs_940_median_rel=float(np.median(rel)),
         water_flag_frac_gt10pct=float(np.mean(np.abs(rel) > 0.10)),
         water_flag=bool(abs(np.median(rel)) > 0.10),
+        **({"water_iron_cm_pct": dict(zip(["p5", "p50", "p95"], (np.percentile(s[:, 2], [5, 50, 95]) * sc.cm1).tolist())),
+            "water_iron_minus_940_cm_pct": dict(zip(["p5", "p50", "p95"],
+                                                   (np.percentile(s[:, 2] - s[:, 0], [5, 50, 95]) * sc.cm1).tolist())),
+            "water_at_table_top_frac": float(np.mean(s[:, 2] >= sc.ws[-1] - 1e-6))} if wi else {}),
         seams=[{k: v for k, v in x.items() if k != "pairs"} for x in seams],
         seam_flagged=any(x["flagged"] for x in seams),
         minutes=(time.time() - t0) / 60,
@@ -567,6 +616,9 @@ def main(argv=None):
                     help="top of the per-pixel water table, as a multiple of the standard profile (humid scenes need more)")
     ap.add_argument("--rows", type=int, default=64)
     ap.add_argument("--bbl-from", help="header whose bad-band list (bbl) to copy, e.g. the provider's reflectance product")
+    ap.add_argument("--selfcal", help="dustran.selfcal JSON: per-spectrometer offset, slope and width (replaces --shift)")
+    ap.add_argument("--water-iron", action="store_true",
+                    help="refit water per pixel by shape, with iron references in the fit (dustran.wateriron)")
     ap.add_argument("--lines", nargs=2, type=int, default=None, help="process only rows R0..R1 (testing)")
     a = ap.parse_args(argv)
     shift = "fit" if a.shift[0] == "fit" else tuple(map(float, a.shift))
@@ -582,7 +634,8 @@ def main(argv=None):
     elif a.aod:
         kw.update(aer=aerosol.Dust.fit_angstrom(a.angstrom), aod=a.aod, aod_ref=550.0)
     return run(a.radiance, a.out_prefix, kw, obs=a.obs, rows=a.rows, log=lambda s: print(s, flush=True),
-               lines=a.lines, bbl_from=a.bbl_from)
+               lines=a.lines, bbl_from=a.bbl_from, selfcal=a.selfcal,
+               water_iron=a.water_iron)
 
 
 if __name__ == "__main__":
